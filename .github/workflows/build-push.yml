@@ -1,0 +1,161 @@
+# Build & push (PETPLAT-49, PETPLAT-105)
+#
+# On push to main: detect which service directories changed, build only
+# those as linux/arm64 images, Trivy-scan each one (CRITICAL blocks the
+# push), push to ECR as petclinic-dev/{service}:{sha7}, then tell the
+# platform repo via repository_dispatch (app-image-built) so its
+# update-image-tags workflow commits the new tags and ArgoCD deploys.
+#
+# Required repo secrets:
+#   AWS_ROLE_ARN          GitHub Actions OIDC role (platform repo: terraform output github_actions_role_arn)
+#   PLATFORM_REPO_TOKEN   fine-grained PAT, Contents: read/write on the platform repo only
+# Optional repo variables:
+#   PLATFORM_REPO         owner/name of the platform repo (default below)
+#   AWS_REGION            ECR region (default eu-central-1)
+#
+# Manual run (Actions > build-push > Run workflow, main only): builds the
+# services listed in the "services" input, or all 8 if left empty. Useful
+# for the first run and for rebuilding after a base-image CVE fix.
+name: build-push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      services:
+        description: Space-separated services to build (empty = all 8)
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      services: ${{ steps.matrix.outputs.services }}
+      tag: ${{ steps.matrix.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # "shared" = files every image is built from; a change there rebuilds all 8.
+      - name: Detect changed services
+        id: filter
+        if: github.event_name == 'push'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+            shared:
+              - 'pom.xml'
+              - 'docker/Dockerfile'
+
+      # Matrix only contains services whose filter is true. Ports come from
+      # docs/technical-spec.md#application-services (several module poms
+      # declare the wrong port).
+      - name: Build matrix
+        id: matrix
+        env:
+          CHANGES: ${{ steps.filter.outputs.changes }}
+          MANUAL_SERVICES: ${{ inputs.services }}
+        run: |
+          set -euo pipefail
+          all='["config-server","discovery-server","api-gateway","customers-service","visits-service","vets-service","genai-service","admin-server"]'
+          ports='{"config-server":8888,"discovery-server":8761,"api-gateway":8080,"customers-service":8081,"visits-service":8082,"vets-service":8083,"genai-service":8084,"admin-server":9090}'
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            # The OIDC role only trusts main.
+            if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+              echo "::error::manual runs are only allowed on main (got ${GITHUB_REF})"
+              exit 1
+            fi
+            services="$(jq -cn --argjson all "${all}" --arg in "${MANUAL_SERVICES}" \
+              '($in | split(" ") | map(select(length > 0))) as $req
+               | if ($req | length) == 0 then $all
+                 elif ($req - $all | length) > 0 then error("unknown service(s): \($req - $all | join(" "))")
+                 else [ $all[] as $s | select($req | index($s)) | $s ] end')"
+          else
+            services="$(jq -c --argjson all "${all}" \
+              'if index("shared") then $all else [ $all[] as $s | select(index($s)) | $s ] end' <<< "${CHANGES}")"
+          fi
+          matrix="$(jq -c --argjson p "${ports}" \
+            '{include: map({service: ., module: ("spring-petclinic-" + .), port: $p[.]})}' <<< "${services}")"
+
+          {
+            echo "services=${services}"
+            echo "matrix=${matrix}"
+            echo "tag=${GITHUB_SHA::7}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Services to build (${GITHUB_EVENT_NAME}): ${services}" >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.services != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/reusable-build-scan-push.yml
+    with:
+      service: ${{ matrix.service }}
+      module: ${{ matrix.module }}
+      port: ${{ matrix.port }}
+      image-tag: ${{ needs.changes.outputs.tag }}
+      ecr-namespace: petclinic-dev
+      aws-region: ${{ vars.AWS_REGION || 'eu-central-1' }}
+    secrets:
+      aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+
+  # Only runs if every matrix build succeeded — a partial set of new tags is
+  # never sent to the platform repo.
+  dispatch:
+    needs: [changes, build]
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Notify platform repo (app-image-built)
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'adrifok/agentic-petclinic-platform' }}
+          SHA: ${{ needs.changes.outputs.tag }}
+          SERVICES: ${{ needs.changes.outputs.services }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::error::PLATFORM_REPO_TOKEN secret is not set"
+            exit 1
+          fi
+          jq -n --arg sha "${SHA}" --argjson services "${SERVICES}" \
+            '{event_type: "app-image-built", client_payload: {sha: $sha, services: $services}}' \
+            | gh api --method POST "repos/${PLATFORM_REPO}/dispatches" --input -
+          echo "Dispatched app-image-built to ${PLATFORM_REPO}: sha=${SHA} services=${SERVICES}" >> "${GITHUB_STEP_SUMMARY}"

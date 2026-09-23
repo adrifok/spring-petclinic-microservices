@@ -1,0 +1,11 @@
+# Trivy allowlist for the build-push pipeline (PETPLAT-105).
+#
+# One CVE ID per line. Every entry needs a comment with the reason, who
+# accepted it, and a review date, e.g.:
+#
+#   # openssl in eclipse-temurin:17 base; no fixed version yet; accepted 2026-09-23, review 2026-10-23
+#   CVE-2026-00000
+#
+# Review scan results: Actions run > Summary shows per-service counts;
+# download the trivy-<service> artifact for the full JSON/table report.
+# Remove entries once a fixed base image is available.

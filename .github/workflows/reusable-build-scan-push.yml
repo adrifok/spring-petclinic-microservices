@@ -1,0 +1,179 @@
+# Reusable: build one service image (linux/arm64), Trivy-scan it, and push
+# to ECR only if the scan passes (PETPLAT-49, PETPLAT-105, PETPLAT-53).
+#
+# Called once per changed service by build-push.yml. Lives directly in
+# .github/workflows/ because GitHub does not load reusable workflows from
+# subdirectories.
+#
+# The caller job must grant `id-token: write` (OIDC) and `contents: read`.
+name: reusable-build-scan-push
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: ECR repo / service name, e.g. customers-service
+        type: string
+        required: true
+      module:
+        description: Maven module directory, e.g. spring-petclinic-customers-service
+        type: string
+        required: true
+      port:
+        description: Container port (EXPOSE), from docs/technical-spec.md#application-services
+        type: number
+        required: true
+      image-tag:
+        description: 7-char commit SHA
+        type: string
+        required: true
+      ecr-namespace:
+        description: ECR repo prefix, e.g. petclinic-dev
+        type: string
+        default: petclinic-dev
+      aws-region:
+        type: string
+        default: eu-central-1
+    secrets:
+      aws-role-arn:
+        description: GitHub Actions OIDC role (terraform output github_actions_role_arn)
+        required: true
+    outputs:
+      image:
+        description: Pushed image reference
+        value: ${{ jobs.build-scan-push.outputs.image }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TRIVY_VERSION: "0.74.0"
+  TRIVY_SHA256: 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+
+jobs:
+  build-scan-push:
+    name: ${{ inputs.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      # JAR only (plus the modules it depends on). The app's -P buildDocker
+      # profile is not used: it hardcodes the image prefix, builds amd64 and
+      # tags latest — see the platform repo's docs/runbooks/ecr-image-build-push.md.
+      - name: Build JAR
+        id: jar
+        env:
+          MODULE: ${{ inputs.module }}
+        run: |
+          set -euo pipefail
+          ./mvnw -B -ntp -pl "${MODULE}" -am clean package
+          version="$(./mvnw -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)"
+          test -f "${MODULE}/target/${MODULE}-${version}.jar"
+          echo "artifact=${MODULE}-${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build into the local daemon (load), not the registry: nothing reaches
+      # ECR until the Trivy gate below passes. provenance off so --load gets a
+      # single-platform image instead of an attestation index.
+      - name: Build image (linux/arm64)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.module }}/target
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            ARTIFACT_NAME=${{ steps.jar.outputs.artifact }}
+            EXPOSED_PORT=${{ inputs.port }}
+          tags: local/${{ inputs.service }}:${{ inputs.image-tag }}
+          load: true
+          push: false
+          provenance: false
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSLf -o "/tmp/${tarball}" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tarball}"
+          echo "${TRIVY_SHA256}  /tmp/${tarball}" | sha256sum -c -
+          sudo tar -xzf "/tmp/${tarball}" -C /usr/local/bin trivy
+          trivy --version
+
+      # Report: HIGH + CRITICAL, never fails. Saved as an artifact; HIGH only
+      # produces a warning (PETPLAT-105).
+      - name: Trivy report (HIGH, CRITICAL)
+        env:
+          IMAGE: local/${{ inputs.service }}:${{ inputs.image-tag }}
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          mkdir -p trivy
+          trivy image --image-src docker --severity HIGH,CRITICAL --ignorefile .github/.trivyignore \
+            --format json --output "trivy/${SERVICE}.json" --exit-code 0 "${IMAGE}"
+          trivy convert --format table --output "trivy/${SERVICE}.txt" "trivy/${SERVICE}.json"
+          high="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "trivy/${SERVICE}.json")"
+          crit="$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "trivy/${SERVICE}.json")"
+          echo "### Trivy: ${SERVICE} — CRITICAL ${crit}, HIGH ${high}" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ "${high}" -gt 0 ]]; then
+            echo "::warning title=Trivy HIGH (${SERVICE})::${high} HIGH vulnerabilities — see the trivy-${SERVICE} artifact"
+          fi
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-${{ inputs.service }}
+          path: trivy/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # Gate: any CRITICAL not in .github/.trivyignore fails the job, so the
+      # push steps below never run.
+      - name: Trivy gate (fail on CRITICAL)
+        env:
+          IMAGE: local/${{ inputs.service }}:${{ inputs.image-tag }}
+        run: |
+          trivy image --image-src docker --skip-db-update --severity CRITICAL --ignorefile .github/.trivyignore \
+            --exit-code 1 --format table "${IMAGE}"
+
+      # AWS credentials only after the image has passed the scan.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          role-session-name: build-push-${{ inputs.service }}-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Push to ECR
+        id: push
+        env:
+          LOCAL: local/${{ inputs.service }}:${{ inputs.image-tag }}
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-namespace }}/${{ inputs.service }}:${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          docker tag "${LOCAL}" "${IMAGE}"
+          docker push "${IMAGE}"
+          echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "Pushed \`${IMAGE}\`" >> "${GITHUB_STEP_SUMMARY}"
