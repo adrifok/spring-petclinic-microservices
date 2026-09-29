@@ -33,6 +33,7 @@
         <!-- CVE fixes beyond what Boot 4.0.8 manages (Trivy CRITICAL gate) -->
         <tomcat.version>11.0.25</tomcat.version>
         <bouncycastle.version>1.86</bouncycastle.version>
+        <freemarker.version>2.3.35</freemarker.version>
         <chaos-monkey-spring-boot.version>3.1.0</chaos-monkey-spring-boot.version>
         <jolokia-core.version>1.7.1</jolokia-core.version>
         <datasource-micrometer.version>2.0.1</datasource-micrometer.version>
